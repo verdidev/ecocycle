@@ -1,0 +1,80 @@
+# =============================================================================
+# EcoCycle - Aplicacao Spring Boot + Oracle Database Free
+#
+# Uso local:      cp .env.example .env   (preencha as senhas)
+#                 docker compose up -d --build
+# Uso servidor:   APP_IMAGE=ghcr.io/<usuario>/ecocycle:sha-xxxxxxx
+#                 docker compose -p ecocycle-staging up -d --no-build --wait
+#
+# O mesmo arquivo serve local, staging e producao: o que muda e o .env e o nome
+# do projeto (-p), que isola rede, volume e containers de cada ambiente.
+# =============================================================================
+
+name: ecocycle
+
+services:
+  oracle-db:
+    # Oracle Database 23ai Free (imagem comunitaria gvenzl, multi-arquitetura amd64/arm64)
+    image: gvenzl/oracle-free:23-slim
+    restart: unless-stopped
+    environment:
+      # Senha de SYS/SYSTEM
+      ORACLE_PASSWORD: ${ORACLE_PASSWORD:?defina ORACLE_PASSWORD no .env}
+      # Cria automaticamente o usuario/schema da aplicacao no PDB FREEPDB1 na 1a subida
+      APP_USER: ${DB_USERNAME:?defina DB_USERNAME no .env}
+      APP_USER_PASSWORD: ${DB_PASSWORD:?defina DB_PASSWORD no .env}
+    volumes:
+      # Volume nomeado: os dados sobrevivem a "docker compose down" e a recriacao do container
+      - oracle-data:/opt/oracle/oradata
+    networks:
+      - ecocycle-net
+    # Sem "ports": o banco NAO e exposto no host; so a aplicacao o acessa pela rede interna.
+    # Para acessar com SQL Developer/DBeaver localmente, use docker-compose.dev.yml.
+    healthcheck:
+      # Script incluso na imagem: verifica se o banco esta aberto e aceitando conexoes
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      # A 1a subida (volume vazio) inicializa os datafiles e pode levar alguns minutos
+      start_period: 120s
+
+  app:
+    image: ${APP_IMAGE:-ecocycle-api:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      oracle-db:
+        # A aplicacao so inicia quando o Oracle estiver saudavel
+        condition: service_healthy
+    environment:
+      # Host = nome do servico Docker (oracle-db), resolvido pelo DNS da rede ecocycle-net
+      DB_URL: ${DB_URL:-jdbc:oracle:thin:@//oracle-db:1521/FREEPDB1}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      APP_SECURITY_USERNAME: ${APP_SECURITY_USERNAME:?defina APP_SECURITY_USERNAME no .env}
+      APP_SECURITY_PASSWORD: ${APP_SECURITY_PASSWORD:?defina APP_SECURITY_PASSWORD no .env}
+      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-local}
+      APP_VERSION: ${APP_VERSION:-dev}
+      JAVA_OPTS: ${JAVA_OPTS:--XX:MaxRAMPercentage=75.0}
+      JPA_SHOW_SQL: ${JPA_SHOW_SQL:-false}
+      FLYWAY_BASELINE_ON_MIGRATE: ${FLYWAY_BASELINE_ON_MIGRATE:-false}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    networks:
+      - ecocycle-net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+
+networks:
+  ecocycle-net:
+    driver: bridge
+
+volumes:
+  oracle-data:

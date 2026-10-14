@@ -1,0 +1,23 @@
+# Somente pom.xml e src/ sao necessarios no build da imagem
+target/
+.git/
+.github/
+.idea/
+.vscode/
+*.iml
+.env
+.env.*
+!.env.example
+logs/
+*.log
+docs/
+scripts/
+deploy/
+README.md
+HELP.md
+docker-compose*.yml
+Dockerfile
+.dockerignore
+.mvn/
+mvnw
+mvnw.cmd

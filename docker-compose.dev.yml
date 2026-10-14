@@ -1,0 +1,11 @@
+# Override APENAS para desenvolvimento local.
+# Publica a porta do Oracle em 127.0.0.1 para usar SQL Developer/DBeaver ou rodar
+# a aplicacao fora do Docker (mvn spring-boot:run) apontando para localhost:1521.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# Nao use este arquivo em staging/producao.
+services:
+  oracle-db:
+    ports:
+      - "127.0.0.1:${ORACLE_PORT:-1521}:1521"

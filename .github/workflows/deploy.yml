@@ -1,0 +1,178 @@
+# =============================================================================
+# Workflow reutilizavel de deploy (chamado por ci-cd.yml para staging e production)
+#
+# Estrategia: o runner do GitHub conecta via SSH no servidor do ambiente, envia
+# docker-compose.yml + scripts + .env (montado a partir dos GitHub Secrets do
+# Environment) e executa scripts/deploy.sh, que faz pull da imagem do GHCR e
+# sobe Oracle + aplicacao com Docker Compose. Depois roda o smoke test.
+#
+# Secrets do Environment (Settings > Environments > <ambiente>):
+#   SSH_HOST, SSH_USER, SSH_PRIVATE_KEY, SSH_KNOWN_HOSTS,
+#   ORACLE_PASSWORD, DB_PASSWORD, APP_SECURITY_PASSWORD
+# Secret opcional (repositorio): GHCR_PULL_TOKEN (so se o pacote GHCR for privado)
+# Variables do Environment:
+#   APP_PORT (ex.: staging 8081, production 8080), APP_SECURITY_USERNAME,
+#   DB_USERNAME (padrao ecocycle), APP_URL (opcional, URL publica p/ verificacao externa),
+#   DEPLOY_PATH (opcional, padrao ecocycle-<ambiente> no home do usuario SSH)
+# =============================================================================
+name: Deploy (reutilizavel)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: staging ou production
+        required: true
+        type: string
+      image:
+        description: Imagem completa e imutavel (ghcr.io/<owner>/ecocycle:sha-xxxxxxx)
+        required: true
+        type: string
+      smoke-mode:
+        description: full (CRUD completo) ou readonly
+        required: false
+        type: string
+        default: readonly
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.APP_URL }}
+    env:
+      ENV_NAME: ${{ inputs.environment }}
+      IMAGE: ${{ inputs.image }}
+      APP_PORT: ${{ vars.APP_PORT || '8080' }}
+      REMOTE_DIR: ${{ vars.DEPLOY_PATH || format('ecocycle-{0}', inputs.environment) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verificar secrets obrigatorios
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          APP_SECURITY_PASSWORD: ${{ secrets.APP_SECURITY_PASSWORD }}
+          APP_SECURITY_USERNAME: ${{ vars.APP_SECURITY_USERNAME }}
+        run: |
+          missing=0
+          for v in SSH_HOST SSH_USER SSH_PRIVATE_KEY SSH_KNOWN_HOSTS ORACLE_PASSWORD DB_PASSWORD APP_SECURITY_PASSWORD APP_SECURITY_USERNAME; do
+            if [ -z "${!v}" ]; then echo "::error::'$v' nao configurado no Environment '$ENV_NAME'"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Configurar chave SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Montar .env do ambiente a partir dos secrets
+        env:
+          ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_USERNAME: ${{ vars.DB_USERNAME || 'ecocycle' }}
+          APP_SECURITY_USERNAME: ${{ vars.APP_SECURITY_USERNAME }}
+          APP_SECURITY_PASSWORD: ${{ secrets.APP_SECURITY_PASSWORD }}
+        run: |
+          umask 077
+          mkdir -p deploy-bundle
+          cat > deploy-bundle/.env <<EOF
+          APP_PORT=${APP_PORT}
+          APP_ENVIRONMENT=${ENV_NAME}
+          APP_VERSION=${IMAGE##*:}
+          APP_IMAGE=${IMAGE}
+          APP_SECURITY_USERNAME=${APP_SECURITY_USERNAME}
+          APP_SECURITY_PASSWORD=${APP_SECURITY_PASSWORD}
+          ORACLE_PASSWORD=${ORACLE_PASSWORD}
+          DB_USERNAME=${DB_USERNAME}
+          DB_PASSWORD=${DB_PASSWORD}
+          DB_URL=jdbc:oracle:thin:@//oracle-db:1521/FREEPDB1
+          JAVA_OPTS=-XX:MaxRAMPercentage=75.0
+          JPA_SHOW_SQL=false
+          EOF
+          cp docker-compose.yml scripts/deploy.sh scripts/smoke-test.sh deploy-bundle/
+
+      - name: Enviar arquivos ao servidor
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          SSH="ssh -i $HOME/.ssh/id_deploy -o BatchMode=yes"
+          $SSH "$SSH_USER@$SSH_HOST" "mkdir -p '$REMOTE_DIR'"
+          scp -i ~/.ssh/id_deploy -o BatchMode=yes \
+            deploy-bundle/.env deploy-bundle/docker-compose.yml \
+            deploy-bundle/deploy.sh deploy-bundle/smoke-test.sh \
+            "$SSH_USER@$SSH_HOST:$REMOTE_DIR/"
+          $SSH "$SSH_USER@$SSH_HOST" "chmod 600 '$REMOTE_DIR/.env' && chmod +x '$REMOTE_DIR/deploy.sh' '$REMOTE_DIR/smoke-test.sh'"
+          rm -f deploy-bundle/.env
+
+      - name: Login do servidor no GHCR (somente se o pacote for privado)
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+        run: |
+          if [ -z "$GHCR_PULL_TOKEN" ]; then
+            echo "GHCR_PULL_TOKEN nao definido: assumindo pacote GHCR publico."
+            exit 0
+          fi
+          printf '%s' "$GHCR_PULL_TOKEN" | ssh -i ~/.ssh/id_deploy -o BatchMode=yes "$SSH_USER@$SSH_HOST" \
+            "docker login ghcr.io -u '${{ github.repository_owner }}' --password-stdin"
+
+      - name: Deploy (docker compose pull + up --wait)
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -o BatchMode=yes "$SSH_USER@$SSH_HOST" \
+            "bash '$REMOTE_DIR/deploy.sh' '$ENV_NAME' '$IMAGE'"
+
+      - name: Smoke test no servidor (${{ inputs.smoke-mode }})
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SMOKE_MODE: ${{ inputs.smoke-mode }}
+        run: |
+          ARG=""
+          [ "$SMOKE_MODE" = "readonly" ] && ARG="--readonly"
+          # As credenciais sao lidas do .env no proprio servidor (nao trafegam na linha de comando)
+          ssh -i ~/.ssh/id_deploy -o BatchMode=yes "$SSH_USER@$SSH_HOST" \
+            "cd '$REMOTE_DIR' && set -a && . ./.env && set +a && bash ./smoke-test.sh http://localhost:\$APP_PORT $ARG"
+
+      - name: Verificacao externa (URL publica)
+        if: vars.APP_URL != ''
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          curl -fsS --retry 10 --retry-delay 6 --retry-all-errors "$APP_URL/actuator/health"
+          echo
+          curl -fsS "$APP_URL/actuator/info" || true
+
+      - name: Resumo do deploy
+        if: always()
+        run: |
+          {
+            echo "## Deploy ${ENV_NAME}"
+            echo "- Imagem: \`${IMAGE}\`"
+            echo "- Status do job: ${{ job.status }}"
+            [ -n "${{ vars.APP_URL }}" ] && echo "- URL: ${{ vars.APP_URL }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Limpar chave SSH
+        if: always()
+        run: rm -f ~/.ssh/id_deploy
